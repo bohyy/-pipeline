@@ -1,0 +1,624 @@
+import os
+# 立即应用PDB修补程序
+import sys
+sys._breakpoint_orig = sys.breakpointhook if hasattr(sys, 'breakpointhook') else None
+sys.breakpointhook = lambda *args, **kwargs: None
+os.environ["PYTHONBREAKPOINT"] = "0"
+
+# 设置指定的CUDA设备（0,4,5,3）
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,4,5,3,6,2,1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import logging
+logging.getLogger("accelerate").setLevel(logging.ERROR)
+
+import json
+import torch
+import argparse
+import re
+from tqdm import tqdm
+from decord import VideoReader, cpu
+from torchvision import transforms as T
+import tempfile
+import imageio.v2 as imageio
+import warnings
+import multiprocessing
+from functools import partial
+warnings.filterwarnings("ignore")
+
+# 修补pdb
+import pdb
+pdb.set_trace = lambda: None
+
+from src.vqvae_wrapper import OpenMAGVIT2_VQModel_Wrapper
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import tokenizer_image_token
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
+import copy
+
+# 常量
+VIDEO_EXTENSIONS = [".avi", ".mp4", ".mkv", ".mov", ".h264"]
+FALLBACK_DESCRIPTION = "The video shows activity with various elements and possibly people interacting."
+
+def is_video_file(filename):
+    return any(filename.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
+
+def init_llava_model(device_id=0, dtype=torch.float16):
+    """初始化LLaVA模型，避免PDB问题"""
+    pretrained = "/data/wuyue/ALTAIR/LLaVA-Video-7B-Qwen2"
+    model_name = "llava_qwen"
+    
+    print(f"[INFO] 在GPU {device_id}上加载模型...")
+    
+    # 简单设备映射，避免复杂配置
+    device_map = f"cuda:{device_id}" 
+    
+    try:
+        # 加载模型，使用最小化参数以避免断点
+        tokenizer, model, image_processor, _ = load_pretrained_model(
+            pretrained, None, model_name,
+            attn_implementation='eager',  # 使用eager避免flash attention问题
+            torch_dtype=dtype,
+            device_map=device_map
+        )
+        
+        # 确保模型处于评估模式
+        model = model.eval()
+        
+        return tokenizer, model, image_processor
+    except Exception as e:
+        print(f"[ERROR] 在GPU {device_id}上加载模型失败: {e}")
+        raise
+
+def process_frames(frames, dtype=torch.float16):
+    """高效处理视频帧"""
+    frames = torch.from_numpy(frames.asnumpy()).permute(0, 3, 1, 2).to(dtype=dtype)
+    
+    transform = T.Compose([
+        T.Resize(128, antialias=True),
+        T.CenterCrop((128, 128)),
+        T.Normalize(mean=[0.5]*3, std=[0.5]*3)
+    ])
+    
+    frames = torch.stack([transform(f.float() / 255.0) for f in frames])
+    return frames.permute(1, 0, 2, 3)
+
+def encode_video_to_tokens(vq_model, video_tensor):
+    """将视频编码为tokens，带错误处理"""
+    try:
+        # 获取模型设备和数据类型
+        vq_device = next(vq_model.parameters()).device
+        vq_dtype = next(vq_model.parameters()).dtype
+        
+        # 将tensor移动到正确的设备和数据类型
+        video_tensor = video_tensor.unsqueeze(0).to(vq_device, dtype=vq_dtype)
+        
+        # 使用适当的方法编码
+        with torch.no_grad():
+            if vq_model.vq_model.use_ema:
+                with vq_model.vq_model.ema_scope():
+                    _, _, indices, _ = vq_model.vq_model.encode(video_tensor)
+            else:
+                _, _, indices, _ = vq_model.vq_model.encode(video_tensor)
+        
+        return indices.view(-1).cpu().tolist()
+    except Exception as e:
+        print(f"[ERROR] Token编码失败: {e}")
+        return []  # 返回空列表作为后备
+
+def describe_video_with_llava(video_tensor, tokenizer, model, processor, conv_template="qwen_1_5"):
+    """生成描述，带错误处理"""
+    try:
+        # 准备LLaVA视频
+        video_np = (video_tensor.clamp(-1, 1) + 1) / 2
+        video_np = (video_np * 255).byte().permute(1, 2, 3, 0).cpu().numpy()
+        
+        # 保存视频到临时文件
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmpf:
+            save_path = tmpf.name
+            imageio.mimwrite(save_path, video_np, fps=8, quality=7)
+        
+        # 处理视频
+        video = imageio.mimread(save_path, memtest=False)
+        video_tensor_llava = processor.preprocess(video, return_tensors="pt")["pixel_values"]
+        
+        # 移动到正确的设备和数据类型
+        model_device = next(model.parameters()).device
+        model_dtype = next(model.parameters()).dtype
+        video_tensor_llava = video_tensor_llava.to(dtype=model_dtype, device=model_device)
+        video_tensor_llava = [video_tensor_llava]
+        
+        # 准备提示语
+        question = DEFAULT_IMAGE_TOKEN + "\nPlease provide a concise description of this video in English. Describe what is happening, including any people, objects, actions, and settings visible in the frames."
+        
+        conv = copy.deepcopy(conv_templates[conv_template])
+        conv.append_message(conv.roles[0], question)
+        conv.append_message(conv.roles[1], None)
+        prompt_question = conv.get_prompt()
+        
+        # 标记化输入
+        input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(model_device)
+        
+        # 使用更简单的参数生成
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                images=video_tensor_llava,
+                modalities=["video"],
+                do_sample=True,
+                temperature=0.7,
+                max_new_tokens=128,
+                top_p=0.9,
+                repetition_penalty=1.1,
+                num_beams=1,
+            )
+        
+        # 解码输出
+        full_output = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        
+        # 提取助手响应
+        assistant_response = extract_assistant_response(full_output, conv.roles)
+        
+        # 清理响应
+        cleaned_response = clean_response(assistant_response)
+        
+        # 验证输出质量
+        if is_low_quality_response(cleaned_response):
+            cleaned_response = FALLBACK_DESCRIPTION
+        
+        # 清理
+        os.remove(save_path)
+        torch.cuda.empty_cache()
+        
+        return cleaned_response
+    except Exception as e:
+        print(f"[ERROR] 描述生成失败: {e}")
+        return FALLBACK_DESCRIPTION
+
+def extract_assistant_response(full_output, roles):
+    """从输出中提取助手响应"""
+    assistant_role = roles[1]
+    
+    if assistant_role + ":" in full_output:
+        parts = full_output.split(assistant_role + ":")
+        if len(parts) > 1:
+            assistant_response = parts[-1].strip()
+            for role in roles:
+                if role + ":" in assistant_response:
+                    assistant_response = assistant_response.split(role + ":")[0].strip()
+            return assistant_response
+    
+    if "ASSISTANT:" in full_output:
+        assistant_response = full_output.split("ASSISTANT:")[-1].strip()
+        for role in ["USER:", "Human:", "HUMAN:"]:
+            if role in assistant_response:
+                assistant_response = assistant_response.split(role)[0].strip()
+        return assistant_response
+    
+    return full_output
+
+def clean_response(response):
+    """通过删除格式清理响应"""
+    patterns = ["###", "##", "#", "Scene:", "Background:", "Actions:", "People:", "Setting:"]
+    cleaned = response
+    
+    for pattern in patterns:
+        if pattern in cleaned:
+            cleaned = " ".join([line.strip() for line in cleaned.split("\n") 
+                               if not line.strip().startswith(pattern)])
+    
+    cleaned = re.sub(r'\*\*(.*?)\*\*', r'\1', cleaned)
+    cleaned = re.sub(r'\*(.*?)\*', r'\1', cleaned)
+    
+    if len(cleaned.strip()) < 20:
+        cleaned = response
+    
+    return cleaned
+
+def is_low_quality_response(response):
+    """检查响应是否质量低"""
+    return (response.strip().lower() == "the" or 
+            len(response.strip()) < 5 or
+            re.search(r'[\u4e00-\u9fff]', response))
+
+def process_video_chunk(args, vq_model, models_info, video_path, cls_name, start, chunk_size, chunk_index):
+    """处理单个视频块，带PDB修复"""
+    try:
+        # 解包模型
+        device_id = models_info["device_id"]
+        tokenizer = models_info["tokenizer"]
+        model = models_info["model"]
+        processor = models_info["processor"]
+        template = models_info["template"]
+        
+        # 确保使用正确的GPU
+        torch.cuda.set_device(device_id)
+        
+        # 读取视频块
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frames = len(vr)
+        
+        # 调整结束帧
+        end = min(start + chunk_size, total_frames)
+        indices = list(range(start, end))
+        
+        # 如果块太小则跳过
+        if len(indices) < chunk_size // 2:
+            return None
+        
+        # 获取并处理帧，带错误处理
+        try:
+            frames = vr.get_batch(indices)
+            vq_dtype = next(vq_model.parameters()).dtype
+            video_tensor = process_frames(frames, dtype=vq_dtype)
+        except Exception as e:
+            print(f"[ERROR] 处理第{chunk_index}块的帧失败: {e}")
+            return None
+        
+        # 生成tokens，带错误处理
+        try:
+            token_ids = encode_video_to_tokens(vq_model, video_tensor)
+        except Exception as e:
+            print(f"[ERROR] 第{chunk_index}块编码失败: {e}")
+            token_ids = []  # 使用空列表作为后备
+        
+        # 在大型LLaVA推理前释放内存
+        frames = None
+        
+        # 生成描述
+        try:
+            prompt = describe_video_with_llava(video_tensor, tokenizer, model, processor, template)
+        except Exception as e:
+            print(f"[ERROR] 为第{chunk_index}块生成描述失败: {e}")
+            prompt = f"The video shows a sequence of {len(indices)} frames displaying various scenes or activities."
+        
+        # 从内存中清除视频tensor
+        video_tensor = None
+        torch.cuda.empty_cache()
+        
+        # 创建输出项
+        item = {
+            "class": cls_name,
+            "file": os.path.basename(video_path),
+            "chunk_index": chunk_index,
+            "prompt": prompt,
+            "token_ids": token_ids
+        }
+        
+        # 创建文件名并保存
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        out_name = f"{cls_name}_{base}_chunk{chunk_index}.json"
+        out_path = os.path.join(args.save_path, out_name)
+        
+        with open(out_path, "w") as fout:
+            json.dump(item, fout, ensure_ascii=False, indent=2)
+        
+        return {
+            "path": out_path,
+            "success": True
+        }
+    
+    except Exception as e:
+        print(f"[ERROR] 处理{video_path}的第{chunk_index}块失败: {e}")
+        return {
+            "path": None,
+            "success": False,
+            "error": str(e)
+        }
+
+def process_device_videos(args, device_id, gpu_id, video_files):
+    """处理分配给特定GPU的所有视频 - 带PDB修复"""
+    # 在分配的设备上创建模型
+    try:
+        # 设置设备
+        torch.cuda.set_device(device_id)
+        torch.cuda.empty_cache()
+        
+        # 为设备特定日志创建目录
+        device_log_dir = os.path.join(args.save_path, f"logs_gpu{gpu_id}")
+        os.makedirs(device_log_dir, exist_ok=True)
+        
+        # 使用更简单的方法初始化模型
+        print(f"[INFO] 在GPU {gpu_id}(设备ID {device_id})上初始化模型...")
+        
+        # 使用float16精度以提高速度
+        model_dtype = torch.float16 if args.dtype == 'float16' else (
+            torch.bfloat16 if args.dtype == 'bfloat16' else torch.float32)
+        
+        # 初始化模型
+        tokenizer, llava_model, processor = init_llava_model(device_id=device_id, dtype=model_dtype)
+        vq_model = OpenMAGVIT2_VQModel_Wrapper(args).to(device_id)
+        vq_model = vq_model.to(dtype=model_dtype)
+        
+        # 创建模型信息字典
+        models_info = {
+            "device_id": device_id,
+            "tokenizer": tokenizer,
+            "model": llava_model,
+            "processor": processor,
+            "template": args.template
+        }
+        
+        # 处理指标
+        success_count = 0
+        failure_count = 0
+        
+        # 处理每个视频
+        for video_idx, (cls_name, video_path) in enumerate(tqdm(video_files, desc=f"GPU {gpu_id} 处理中")):
+            try:
+                print(f"\n[START-GPU{gpu_id}] 处理文件 {video_idx+1}/{len(video_files)}: {video_path}")
+                
+                # 读取视频 - 如果文件不存在则跳过
+                if not os.path.exists(video_path):
+                    print(f"[GPU{gpu_id}-SKIP] 文件未找到: {video_path}")
+                    continue
+                    
+                vr = VideoReader(video_path, ctx=cpu(0))
+                total_frames = len(vr)
+                chunk_size = args.vq_sequence_length
+                
+                # 如果视频太短则跳过
+                if total_frames < chunk_size // 2:
+                    print(f"[GPU{gpu_id}-SKIP] 视频太短: {video_path}")
+                    continue
+                
+                # 按顺序处理块以避免PDB问题
+                results = []
+                for chunk_index, start in enumerate(range(0, total_frames, chunk_size)):
+                    # 如果最后一块太小则跳过
+                    if start + chunk_size // 2 > total_frames:
+                        continue
+                        
+                    # 直接处理块以避免线程问题
+                    result = process_video_chunk(
+                        args, vq_model, models_info, 
+                        video_path, cls_name, start, chunk_size, chunk_index
+                    )
+                    
+                    if result and result.get("path"):
+                        results.append(result)
+                        success_count += 1
+                        print(f"[GPU{gpu_id}-SAVED] {result['path']}")
+                    else:
+                        failure_count += 1
+                
+                # 每个视频后清除缓存
+                torch.cuda.empty_cache()
+                
+                # 每个视频后记录进度
+                with open(os.path.join(device_log_dir, "progress.txt"), "a") as log:
+                    log.write(f"完成 {video_path}: {len(results)} 块\n")
+                
+                print(f"[GPU{gpu_id}-FINISHED] {video_path} 完成 {len(results)} 块")
+                
+            except Exception as e:
+                print(f"[GPU{gpu_id}-FAILED] {video_path} 失败原因: {e}")
+                failure_count += 1
+                
+                # 将错误写入日志
+                with open(os.path.join(device_log_dir, "errors.txt"), "a") as log:
+                    log.write(f"处理 {video_path} 时出错: {str(e)}\n")
+                continue
+                
+            # 每隔几个视频进行更积极的清理
+            if args.aggressive_cleanup and (video_idx + 1) % 3 == 0:
+                print(f"[GPU{gpu_id}] 执行内存清理...")
+                del tokenizer, llava_model, processor, vq_model
+                torch.cuda.empty_cache()
+                
+                # 重新初始化模型
+                tokenizer, llava_model, processor = init_llava_model(device_id=device_id, dtype=model_dtype)
+                vq_model = OpenMAGVIT2_VQModel_Wrapper(args).to(device_id)
+                vq_model = vq_model.to(dtype=model_dtype)
+                
+                models_info = {
+                    "device_id": device_id,
+                    "tokenizer": tokenizer,
+                    "model": llava_model,
+                    "processor": processor,
+                    "template": args.template
+                }
+        
+        # 最终清理
+        del tokenizer, llava_model, processor, vq_model
+        torch.cuda.empty_cache()
+        
+        # 写入最终摘要
+        with open(os.path.join(device_log_dir, "summary.txt"), "w") as log:
+            log.write(f"GPU {gpu_id} 摘要:\n")
+            log.write(f"处理的总视频数: {len(video_files)}\n")
+            log.write(f"成功块数: {success_count}\n")
+            log.write(f"失败块数: {failure_count}\n")
+        
+        print(f"[GPU{gpu_id}] 处理完成。成功: {success_count}, 失败: {failure_count}")
+        return True
+    
+    except Exception as e:
+        print(f"[ERROR] GPU {gpu_id} 处理失败: {e}")
+        
+        # 尝试保存错误信息
+        try:
+            error_dir = os.path.join(args.save_path, "errors")
+            os.makedirs(error_dir, exist_ok=True)
+            with open(os.path.join(error_dir, f"gpu{gpu_id}_critical_error.txt"), "w") as log:
+                log.write(f"GPU {gpu_id} 严重错误: {str(e)}\n")
+        except:
+            pass
+            
+        return False
+
+def distribute_videos(video_files, gpu_ids):
+    """在指定的多个GPU之间分配视频"""
+    # 创建每个gpu_id的分配
+    distribution = {gpu_id: [] for gpu_id in gpu_ids}
+    
+    # 尝试按文件大小排序
+    try:
+        video_files.sort(key=lambda x: os.path.getsize(x[1]) if os.path.exists(x[1]) else 0, reverse=True)
+    except Exception as e:
+        print(f"[WARNING] 按文件大小排序出错: {e}, 使用默认顺序")
+    
+    # 在GPU之间均匀分配视频
+    for i, video_file in enumerate(video_files):
+        target_gpu = gpu_ids[i % len(gpu_ids)]
+        distribution[target_gpu].append(video_file)
+    
+    # 打印分布统计信息
+    for gpu_id in gpu_ids:
+        print(f"[INFO] GPU {gpu_id}: {len(distribution[gpu_id])} 个视频")
+    
+    return distribution
+
+def convert_ucf101(args):
+    """主处理函数，带PDB修复，支持自定义GPU"""
+    # 创建输出目录
+    os.makedirs(args.save_path, exist_ok=True)
+    
+    # 找到所有视频文件
+    all_files = []
+    if os.path.isdir(args.ucf_root):
+        # 检查是平面结构还是层次结构
+        video_files = [
+            f for f in os.listdir(args.ucf_root) 
+            if os.path.isfile(os.path.join(args.ucf_root, f)) and is_video_file(f)
+        ]
+        
+        if video_files:
+            print(f"[INFO] 检测到平面结构，共 {len(video_files)} 个视频文件。")
+            for fname in sorted(video_files):
+                all_files.append(("unknown", os.path.join(args.ucf_root, fname)))
+        else:
+            print("[INFO] 尝试检测类文件夹结构...")
+            for cls_name in sorted(os.listdir(args.ucf_root)):
+                cls_dir = os.path.join(args.ucf_root, cls_name)
+                if not os.path.isdir(cls_dir):
+                    continue
+                for fname in sorted(os.listdir(cls_dir)):
+                    if is_video_file(fname):
+                        all_files.append((cls_name, os.path.join(cls_dir, fname)))
+    else:
+        # 单文件模式
+        if is_video_file(args.ucf_root):
+            all_files.append(("unknown", args.ucf_root))
+    
+    if not all_files:
+        print("[ERROR] 未找到视频文件。请检查路径和扩展名。")
+        return
+    
+    print(f"[INFO] 找到 {len(all_files)} 个视频文件。")
+    
+    # 检查GPU可用性
+    try:
+        available_gpus = torch.cuda.device_count()
+        print(f"[INFO] 系统中检测到 {available_gpus} 个GPU")
+    except:
+        print("[ERROR] 检测GPU失败。尝试使用CPU继续...")
+        available_gpus = 0
+    
+    # 使用指定的GPU ID (0,4,5,3)
+    gpu_ids = [0, 4, 5, 3, 6, 2]  # 这些是逻辑GPU ID
+    
+    # 映射到CUDA_VISIBLE_DEVICES设置后的设备ID
+    device_ids = list(range(len(gpu_ids)))  # 这将是实际设备ID: [0,1,2,3]
+    
+    gpu_device_map = {gpu_ids[i]: device_ids[i] for i in range(len(gpu_ids))}
+    
+    print(f"[INFO] 使用以下GPU进行视频处理: {gpu_ids}")
+    print(f"[INFO] GPU映射: {gpu_device_map}")
+    
+    # 在指定的GPU之间分配视频
+    distribution = distribute_videos(all_files, gpu_ids)
+    
+    # 在每个设备上处理视频
+    processes = []
+    for gpu_id in gpu_ids:
+        device_id = gpu_device_map[gpu_id]
+        device_files = distribution.get(gpu_id, [])
+        if not device_files:
+            continue
+            
+        print(f"[INFO] 为GPU {gpu_id}(设备ID {device_id})启动进程，处理 {len(device_files)} 个视频")
+        
+        # 为每个GPU创建单独的进程
+        p = multiprocessing.Process(
+            target=process_device_videos,
+            args=(args, device_id, gpu_id, device_files)
+        )
+        p.daemon = True  # 使进程成为守护进程，如果父进程终止，它也会终止
+        p.start()
+        processes.append(p)
+    
+    # 等待所有进程完成，带超时处理
+    try:
+        for p in processes:
+            p.join(timeout=7200)  # 每个进程2小时超时
+            
+            # 超时后检查进程是否仍然活跃
+            if p.is_alive():
+                print("[WARNING] 进程超时。终止中...")
+                p.terminate()
+                p.join(5)  # 给它5秒钟终止
+    except KeyboardInterrupt:
+        print("[INFO] 检测到键盘中断。关闭中...")
+        for p in processes:
+            p.terminate()
+            p.join(5)
+    
+    print(f"\n✅ 完成。所有输出保存在: {args.save_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # 原始参数 - 仅保留这些以避免兼容性问题
+    parser.add_argument("--ucf_root", type=str, default="/data/wuyue/output/t7")
+    parser.add_argument("--save_path", type=str, default="/data/wuyue/output/tokenize")
+    parser.add_argument("--vq_config", type=str, default="/data/wuyue/ALTAIR/configs/ucf101_lfqgan_128_L.yaml")
+    parser.add_argument("--vq_sequence_length", type=int, default=17)
+    parser.add_argument("--vq_resolution", type=int, default=128)
+    parser.add_argument("--vq_checkpoint", type=str, default="/data/wuyue/ALTAIR/checkpoint/video_128_262144.ckpt")
+    parser.add_argument("--dtype", type=str, choices=['float16', 'bfloat16', 'float32'], default='float16')
+    parser.add_argument("--validate_model", action="store_true")
+    parser.add_argument("--template", type=str, default="qwen_1_5")
+    parser.add_argument("--debug", action="store_true")
+    
+    # 仅保留这些额外参数以保持兼容性
+    parser.add_argument("--gpu_split", type=str, default="14:13",
+                       help="GPU 0和1之间的内存分割（例如，'14:13'）")
+    parser.add_argument("--force_layer_split", action="store_true",
+                       help="强制GPU之间手动分割层")
+    parser.add_argument("--aggressive_cleanup", action="store_true", 
+                        help="视频之间更积极的内存清理")
+    parser.add_argument("--max_threads_per_gpu", type=int, default=3,
+                       help="每个GPU的最大并发块数")
+    
+    # 添加自定义GPU选项（默认使用上面直接设置的0,4,5,3）
+    parser.add_argument("--custom_gpus", type=str, default="0,4,5,3,6,2,1",
+                       help="要使用的自定义GPU ID，用逗号分隔")
+    
+    args = parser.parse_args()
+    
+    # 设置日志记录
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+    
+    # 如果命令行指定了自定义GPU，则覆盖硬编码的设置
+    if args.custom_gpus != "0,4,5,3,6,2,1":
+        # 更新CUDA_VISIBLE_DEVICES
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.custom_gpus
+        print(f"[INFO] 使用自定义GPU设置: {args.custom_gpus}")
+    
+    # 打印配置
+    print(f"\n[INFO] 运行多GPU配置...")
+    print(f"[INFO] 使用dtype: {args.dtype}")
+    print(f"[INFO] GPU内存分配: {args.gpu_split}")
+    print(f"[INFO] 手动层分割: {'启用' if args.force_layer_split else '自动'}")
+    print(f"[INFO] 积极清理: {'启用' if args.aggressive_cleanup else '禁用'}")
+    print(f"[INFO] 每个GPU的最大线程数: {args.max_threads_per_gpu}")
+    print(f"[INFO] 已自动禁用PDB断点")
+    print(f"[INFO] 使用GPU: {'默认0,4,5,3' if args.custom_gpus == '0,4,5,3,6,2,1' else args.custom_gpus}")
+    
+    # 运行带PDB修复的转换
+    convert_ucf101(args)
